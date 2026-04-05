@@ -1,4 +1,4 @@
-This is the anime feedback admin project built with [Next.js](https://nextjs.org).
+This is the anime feedback admin project built with [Next.js](https://nextjs.org)..
 
 ## Getting Started
 
