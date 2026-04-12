@@ -1,0 +1,5 @@
+enabled,case_id,expected_is_demand,source_group,source_sender,source_time,note,screenshot_path,expected_title,expected_category,expected_essence_key,review_note
+true,demand-001,true,🍉文案,用户A,,要画笔工具 想都要蛋糕修 画头发 画一点背景 头发闪光,,画笔工具支持画头发画背景,破次元新功能需求,自由调整可以手搓自己画东西更自由的二次元创作,标准需求样例
+true,demand-002,true,🍉文案,用户B,,头发反重力成功率较高但头发存在多个颜色的时候会出现头发不够准的情况,,头发多色时反重力颜色不准,现有破次元功能优化,头发反重力在多色情况下颜色更精准,优化类样例
+true,non-demand-001,false,活动群,运营A,,哈哈哈好好看,,,,,,纯闲聊应该被过滤
+true,non-demand-002,false,活动群,运营B,,收到 我知道了,,,,,,纯回复应该被过滤

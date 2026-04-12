@@ -7,7 +7,10 @@
     "dev:lan": "NODE_EXTRA_CA_CERTS=/etc/ssl/cert.pem next dev --webpack --hostname 0.0.0.0 --port 3001",
     "build": "NODE_EXTRA_CA_CERTS=/etc/ssl/cert.pem next build",
     "start": "NODE_EXTRA_CA_CERTS=/etc/ssl/cert.pem next start",
-    "lint": "eslint"
+    "lint": "eslint",
+    "eval:analyze": "NODE_EXTRA_CA_CERTS=/etc/ssl/cert.pem node scripts/evaluate-platform-analysis.mjs",
+    "wechat:capture": "NODE_EXTRA_CA_CERTS=/etc/ssl/cert.pem node scripts/wechat-demand-capture.mjs",
+    "wechat:capture:submit": "DRY_RUN=false REQUIRE_CONFIRM=true NODE_EXTRA_CA_CERTS=/etc/ssl/cert.pem node scripts/wechat-demand-capture.mjs"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.100.0",
@@ -15,6 +18,7 @@
     "mammoth": "^1.12.0",
     "next": "16.2.1",
     "openai": "^6.32.0",
+    "playwright": "^1.59.1",
     "react": "19.2.4",
     "react-dom": "19.2.4",
     "xlsx": "^0.18.5"

@@ -1,6 +1,37 @@
 import { getSupabaseAdminOrError } from "@/lib/supabase/server";
+import {
+  AnalyzeFeedbackError,
+  analyzeFeedbackWithAi,
+  type AnalyzeFeedbackResult,
+} from "@/lib/ai/analyze-feedback";
 
 export const runtime = "nodejs";
+
+function parseBooleanFormValue(value: FormDataEntryValue | null) {
+  const text = String(value ?? "").trim().toLowerCase();
+  return ["1", "true", "yes", "y", "on"].includes(text);
+}
+
+function buildSourceContext(opts: {
+  source: string;
+  sourceGroup: string;
+  sourceTime: string;
+  sourceSender: string;
+  note: string;
+  aiDetails: string;
+}) {
+  const tags: string[] = [];
+  if (opts.source) tags.push(`来源: ${opts.source}`);
+  if (opts.sourceGroup) tags.push(`群聊: ${opts.sourceGroup}`);
+  if (opts.sourceTime) tags.push(`时间: ${opts.sourceTime}`);
+  if (opts.sourceSender) tags.push(`发送者: ${opts.sourceSender}`);
+
+  const blocks: string[] = [];
+  if (tags.length > 0) blocks.push(`[${tags.join("] [")}]`);
+  if (opts.note) blocks.push(`原文：${opts.note}`);
+  if (opts.aiDetails) blocks.push(opts.aiDetails);
+  return blocks.filter(Boolean).join("\n\n");
+}
 
 type FeedbackRow = {
   id: string;
@@ -29,59 +60,22 @@ export async function GET(req: Request) {
   const { searchParams } = new URL(req.url);
   const status = searchParams.get("status") ?? "all";
 
-  const baseSelect =
-    "id, created_at, updated_at, user_nickname, operator_name, category, essence_key, weight, title, detail, status, screenshot_bucket, screenshot_path, screenshot_public_url, ai_summary";
-  const midSelect =
-    "id, created_at, updated_at, user_nickname, operator_name, category, weight, title, detail, status, screenshot_bucket, screenshot_path, screenshot_public_url, ai_summary";
-  const legacySelect =
-    "id, created_at, updated_at, category, title, detail, status, screenshot_bucket, screenshot_path, screenshot_public_url, ai_summary";
+  const select =
+    "id, created_at, updated_at, user_nickname, operator_name, category, essence_key, weight, title, detail, status, needs_review, screenshot_bucket, screenshot_path, screenshot_public_url, ai_summary";
 
-  async function run(select: string) {
-    let query = supabaseAdmin
-      .from("feedback_submissions")
-      .select(select)
-      .order("created_at", { ascending: false });
-    if (status !== "all") query = query.eq("status", status);
-    return await query.returns<FeedbackRow[]>();
-  }
+  const needsReviewFilter = searchParams.get("needs_review");
 
-  const first = await run(baseSelect);
-  if (!first.error) return Response.json({ items: first.data ?? [] });
+  let query = supabaseAdmin
+    .from("feedback_submissions")
+    .select(select)
+    .order("created_at", { ascending: false });
+  if (status !== "all") query = query.eq("status", status);
+  if (needsReviewFilter === "true") query = query.eq("needs_review", true);
+  if (needsReviewFilter === "false") query = query.eq("needs_review", false);
 
-  // 兼容：如果你还没在 Supabase 加新列，先降级查询以保证历史能显示
-  const msg = first.error.message || "";
-  // 1) 仅缺少 essence_key：先退化到 midSelect（保留 user/operator）
-  if (msg.includes("does not exist") && msg.includes("essence_key")) {
-    const second = await run(midSelect);
-    if (!second.error) return Response.json({ items: second.data ?? [] });
-    // 若又报缺 user/operator，则继续走 legacy
-    const msg2 = second.error.message || "";
-    if (msg2.includes("does not exist") && (msg2.includes("user_nickname") || msg2.includes("operator_name"))) {
-      const third = await run(legacySelect);
-      if (third.error) return Response.json({ error: third.error.message }, { status: 500 });
-      return Response.json({ items: third.data ?? [] });
-    }
-    return Response.json({ error: second.error.message }, { status: 500 });
-  }
-
-  // 2) 缺 user/operator（以及可能缺 essence）：直接退化 legacySelect
-  if (msg.includes("does not exist") && (msg.includes("user_nickname") || msg.includes("operator_name"))) {
-    const second = await run(legacySelect);
-    if (second.error) {
-      return Response.json({ error: second.error.message }, { status: 500 });
-    }
-    return Response.json({ items: second.data ?? [] });
-  }
-  // 3) 仅缺 weight：退化到不含 weight 的 select（但保留 essence_key 等）
-  if (msg.includes("does not exist") && msg.includes("weight")) {
-    const noWeightSelect =
-      "id, created_at, updated_at, user_nickname, operator_name, category, essence_key, title, detail, status, screenshot_bucket, screenshot_path, screenshot_public_url, ai_summary";
-    const second = await run(noWeightSelect);
-    if (!second.error) return Response.json({ items: second.data ?? [] });
-    return Response.json({ error: second.error.message }, { status: 500 });
-  }
-
-  return Response.json({ error: first.error.message }, { status: 500 });
+  const { data, error } = await query.returns<FeedbackRow[]>();
+  if (error) return Response.json({ error: error.message }, { status: 500 });
+  return Response.json({ items: data ?? [] });
 }
 
 export async function POST(req: Request) {
@@ -99,6 +93,12 @@ export async function POST(req: Request) {
   const providedCategory = String(formData.get("category") ?? "").trim();
   const providedDetails = String(formData.get("details") ?? "").trim();
   const providedEssenceKey = String(formData.get("essence_key") ?? "").trim();
+  const source = String(formData.get("source") ?? "").trim();
+  const sourceGroup = String(formData.get("source_group") ?? "").trim();
+  const sourceTime = String(formData.get("source_time") ?? "").trim();
+  const sourceSender = String(formData.get("source_sender") ?? "").trim();
+  const autoAnalyze = parseBooleanFormValue(formData.get("auto_analyze"));
+  const formNeedsReview = parseBooleanFormValue(formData.get("needs_review"));
 
   if (!userNickname || !operatorName) {
     return Response.json(
@@ -110,78 +110,145 @@ export async function POST(req: Request) {
     return Response.json({ error: "invalid operator_name" }, { status: 400 });
   }
 
-  // 兼容多图：前端会把每张图都以字段名 screenshots 发送
+  if (!note && !providedTitle) {
+    return Response.json(
+      { error: "至少需要提供 note（用户原话）或 title" },
+      { status: 400 }
+    );
+  }
+
   const screenshotFiles = formData.getAll("screenshots");
   const fallbackSingle = formData.get("screenshot");
   const firstFileCandidate = screenshotFiles?.[0] ?? fallbackSingle;
-
-  if (!firstFileCandidate || typeof (firstFileCandidate as any).arrayBuffer !== "function") {
-    return Response.json({ error: "screenshot(s) is required" }, { status: 400 });
-  }
+  const hasScreenshot =
+    !!firstFileCandidate &&
+    typeof (firstFileCandidate as any).arrayBuffer === "function";
 
   const id = crypto.randomUUID();
 
-  const file = firstFileCandidate as File;
-  const extFromName = (() => {
-    const name = file.name || "";
-    const m = name.match(/\.([a-zA-Z0-9]+)$/);
-    return m?.[1]?.toLowerCase();
-  })();
-  const ext = extFromName || (file.type === "image/png" ? "png" : "jpg");
+  let screenshotPublicUrl: string | null = null;
+  let objectPath: string | null = null;
 
-  const objectPath = `${id}/${id}.${ext}`;
-  const buf = Buffer.from(await file.arrayBuffer());
+  if (hasScreenshot) {
+    const file = firstFileCandidate as File;
+    const extFromName = (() => {
+      const name = file.name || "";
+      const m = name.match(/\.([a-zA-Z0-9]+)$/);
+      return m?.[1]?.toLowerCase();
+    })();
+    const ext = extFromName || (file.type === "image/png" ? "png" : "jpg");
 
-  const uploadRes = await supabaseAdmin.storage.from("screenshots").upload(objectPath, buf, {
-    contentType: file.type || "application/octet-stream",
-    upsert: false,
-  });
+    objectPath = `${id}/${id}.${ext}`;
+    const buf = Buffer.from(await file.arrayBuffer());
 
-  if (uploadRes.error) {
-    return Response.json({ error: uploadRes.error.message }, { status: 500 });
+    const uploadRes = await supabaseAdmin.storage
+      .from("screenshots")
+      .upload(objectPath, buf, {
+        contentType: file.type || "application/octet-stream",
+        upsert: false,
+      });
+
+    if (uploadRes.error) {
+      return Response.json(
+        { error: uploadRes.error.message },
+        { status: 500 }
+      );
+    }
+
+    const { data: publicData } = supabaseAdmin.storage
+      .from("screenshots")
+      .getPublicUrl(objectPath);
+    screenshotPublicUrl = publicData.publicUrl;
   }
 
-  const { data: publicData } = supabaseAdmin.storage
-    .from("screenshots")
-    .getPublicUrl(objectPath);
-  const screenshotPublicUrl = publicData.publicUrl;
+  const needsPlatformAnalysis =
+    autoAnalyze ||
+    (!providedTitle && !providedCategory && !providedDetails && !providedEssenceKey);
 
-  const category = providedCategory || "非二次元需求";
-  const title = providedTitle || "（待总结）";
-  const details = providedDetails || note || "";
-  const essenceKey = providedEssenceKey || title;
-  const aiSummary = title;
-  const aiError: string | null = null;
+  let analyzed: AnalyzeFeedbackResult | null = null;
+
+  if (needsPlatformAnalysis) {
+    try {
+      const images =
+        screenshotPublicUrl
+          ? [{ type: "url" as const, url: screenshotPublicUrl }]
+          : [];
+      analyzed = await analyzeFeedbackWithAi({ note, images });
+    } catch (e: any) {
+      if (e instanceof AnalyzeFeedbackError) {
+        return Response.json(
+          { error: e.message, ...(e.details ?? {}) },
+          { status: e.status }
+        );
+      }
+      return Response.json(
+        { error: e?.message ?? "平台自动分析失败" },
+        { status: 500 }
+      );
+    }
+  }
+
   const aiModel = process.env.AI_MODEL || null;
+  const sourceCtx = buildSourceContext({
+    source,
+    sourceGroup,
+    sourceTime,
+    sourceSender: sourceSender || userNickname,
+    note,
+    aiDetails: "",
+  });
+
+  const demands =
+    analyzed && analyzed.demands.length > 0
+      ? analyzed.demands
+      : [
+          {
+            summary: providedTitle || "（待总结）",
+            category: providedCategory || "用户其他反馈",
+            details: providedDetails || "",
+            essenceKey: providedEssenceKey || providedTitle || "（待总结）",
+          },
+        ];
+
+  const needsReview = formNeedsReview || (analyzed?.needsReview === true);
+
+  const insertRows = demands.map((demand) => ({
+    id: crypto.randomUUID(),
+    user_nickname: userNickname,
+    operator_name: operatorName,
+    category: demand.category,
+    essence_key: demand.essenceKey,
+    title: demand.summary,
+    detail:
+      demand.details
+        ? [sourceCtx, demand.details].filter(Boolean).join("\n\n")
+        : sourceCtx || note || "",
+    status: "pending" as const,
+    needs_review: needsReview,
+    screenshot_bucket: objectPath ? "screenshots" : null,
+    screenshot_path: objectPath,
+    screenshot_public_url: screenshotPublicUrl,
+    ai_summary: demand.summary,
+    ai_error: null,
+    ai_model: aiModel,
+  }));
 
   const { data, error } = await supabaseAdmin
     .from("feedback_submissions")
-    .insert({
-      id,
-      user_nickname: userNickname,
-      operator_name: operatorName,
-      category,
-      essence_key: essenceKey,
-      title,
-      detail: details,
-      status: "pending",
-      screenshot_bucket: "screenshots",
-      screenshot_path: objectPath,
-      screenshot_public_url: screenshotPublicUrl,
-      ai_summary: aiSummary,
-      ai_error: aiError,
-      ai_model: aiModel,
-    })
+    .insert(insertRows)
     .select(
       "id, created_at, updated_at, user_nickname, operator_name, category, essence_key, title, detail, status, screenshot_bucket, screenshot_path, screenshot_public_url, ai_summary"
     )
-    .single()
-    .returns<FeedbackRow>();
+    .returns<FeedbackRow[]>();
 
   if (error) {
     return Response.json({ error: error.message }, { status: 500 });
   }
 
-  return Response.json({ item: data });
+  return Response.json({
+    items: data ?? [],
+    item: data?.[0] ?? null,
+    demand_count: demands.length,
+  });
 }
 

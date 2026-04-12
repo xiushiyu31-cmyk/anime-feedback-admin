@@ -5,6 +5,11 @@ export const runtime = "nodejs";
 type Status = "pending" | "processing" | "done";
 type PatchBody = {
   status?: string;
+  needs_review?: boolean;
+  title?: string;
+  category?: string;
+  detail?: string;
+  essence_key?: string;
   ai_summary?: string | null;
   ai_model?: string | null;
   ai_error?: string | null;
@@ -31,6 +36,11 @@ export async function PATCH(
 
   const patch: Record<string, unknown> = {};
   if (status !== undefined) patch.status = status;
+  if (body.needs_review !== undefined) patch.needs_review = body.needs_review;
+  if (body.title !== undefined) patch.title = body.title;
+  if (body.category !== undefined) patch.category = body.category;
+  if (body.detail !== undefined) patch.detail = body.detail;
+  if (body.essence_key !== undefined) patch.essence_key = body.essence_key;
   if (body.ai_summary !== undefined) patch.ai_summary = body.ai_summary;
   if (body.ai_model !== undefined) patch.ai_model = body.ai_model;
   if (body.ai_error !== undefined) patch.ai_error = body.ai_error;

@@ -37,7 +37,7 @@ async function ensureImportTempBucketExists() {
   }
 }
 
-type OutCategory = "功能新增" | "性能优化" | "用户活动" | "其他";
+type OutCategory = "现有破次元功能优化" | "破次元新功能需求" | "软件非破次元功能需求" | "用户其他反馈";
 type StreamItem = {
   row_index: number; // 1-based（不含表头）
   /** 同一 row_index 拆分出的子序号，从 1 开始 */
@@ -51,7 +51,7 @@ type StreamItem = {
   feedback_summary: string;
   image_url: string | null;
   feedback_count?: number | null;
-  weight: number; // 1-10
+  weight: number;
   /** 关键词（用于排名聚合/热度统计） */
   keywords: string[];
   /** 可选标签（如：bug/建议/体验/崩溃等） */
@@ -62,9 +62,10 @@ type StreamItem = {
 
 const JSON_RETRY_PROMPT = [
   "你上一条输出不符合要求。",
-  "请将“原输出”严格转换为【纯 JSON】并只输出 JSON，不要 markdown，不要解释。",
+  "请严格转换为【纯 JSON】并只输出 JSON，不要 markdown，不要解释。",
   "格式必须是：{\"items\":[...]}。",
-  "items 中每个元素必须包含：row_index, sub_index(从1开始), item_id, essence_key(2~10字), category(功能新增|性能优化|用户活动|其他), original_text, feedback_summary, weight(1~10整数), keywords(字符串数组)。",
+  "items 中每个元素必须包含：row_index, sub_index(从1开始), item_id, essence_key(2~10字), category(现有破次元功能优化|破次元新功能需求|软件非破次元功能需求|用户其他反馈), original_text, feedback_summary, keywords(字符串数组)。",
+  "每一行输入都必须产出至少 1 条 item。如果原文已是简短需求标题，直接用原文作为 essence_key 和 feedback_summary。",
   "如果某一行反馈包含多个需求点，必须拆成多条，并为同一 row_index 递增 sub_index。",
   "如果你判断某条是无意义乱码/测试文本，请设置 is_invalid=true，并给出 keywords=[]。",
 ].join("\n");
@@ -167,11 +168,10 @@ type RowForAi = {
 
 function essenceFallbackFromText(primary: string, secondary: string) {
   const base = String(primary || secondary || "").replace(/\s+/g, " ").trim();
-  if (!base) return "待人工总结";
+  if (!base) return "（无标题）";
   const cleaned = base.replace(/[#*【】\[\]()（）]/g, "").trim();
-  const slice = cleaned.slice(0, 8);
-  if (slice.length >= 5) return slice;
-  return "待人工总结";
+  if (!cleaned) return "（无标题）";
+  return cleaned.slice(0, 20) || "（无标题）";
 }
 
 function buildFallbackItems(batch: RowForAi[]): StreamItem[] {
@@ -181,7 +181,7 @@ function buildFallbackItems(batch: RowForAi[]): StreamItem[] {
     const sum = r.feedback_summary.trim();
     const pain = truncateForModel(voice || sum, 80);
     const oneLine = truncateForModel(sum || voice, 40);
-    const w = heuristicWeight(voice || sum, r.feedback_count);
+    const fc = Math.max(1, Math.round(Number(r.feedback_count ?? 1) || 1));
     out.push({
       row_index: r.row_index,
       sub_index: 1,
@@ -193,7 +193,7 @@ function buildFallbackItems(batch: RowForAi[]): StreamItem[] {
       feedback_summary: oneLine,
       image_url: r.image_url,
       feedback_count: r.feedback_count,
-      weight: Math.max(1, Math.min(10, Math.round(Number(w) || 3))),
+      weight: fc,
       keywords: [],
       tags: [],
     });
@@ -219,13 +219,26 @@ function coerceMessageContentToText(content: any): string {
 
 function normalizeCategory(raw: string): OutCategory {
   const s = String(raw ?? "").trim();
-  if (s === "功能新增" || s === "性能优化" || s === "用户活动" || s === "其他") return s;
-  if (s.includes("新增") || s.includes("支持") || s.includes("增加") || s.includes("补充")) return "功能新增";
-  if (s.includes("性能") || s.includes("卡") || s.includes("慢") || s.includes("耗电") || s.includes("发热"))
-    return "性能优化";
-  if (s.includes("活动") || s.includes("运营") || s.includes("任务") || s.includes("积分") || s.includes("签到"))
-    return "用户活动";
-  return "其他";
+  if (
+    s === "现有破次元功能优化" ||
+    s === "破次元新功能需求" ||
+    s === "软件非破次元功能需求" ||
+    s === "用户其他反馈"
+  )
+    return s;
+  if (s.includes("破次元") && (s.includes("优化") || s.includes("改进") || s.includes("现有")))
+    return "现有破次元功能优化";
+  if (s.includes("破次元") || s.includes("二次元") || s.includes("新功能"))
+    return "破次元新功能需求";
+  if (s.includes("非破次元") || s.includes("软件") || s.includes("通用") || s.includes("付费") || s.includes("设备"))
+    return "软件非破次元功能需求";
+  if (s.includes("活动") || s.includes("反馈") || s.includes("其他") || s.includes("咨询"))
+    return "用户其他反馈";
+  // legacy mapping
+  if (s === "功能新增") return "破次元新功能需求";
+  if (s === "性能优化") return "现有破次元功能优化";
+  if (s === "用户活动" || s === "其他") return "用户其他反馈";
+  return "用户其他反馈";
 }
 
 function heuristicWeight(text: string, feedbackCount?: number | null) {
@@ -439,37 +452,77 @@ function chunk<T>(arr: T[], size: number): T[][] {
 }
 
 const SYSTEM_PROMPT = [
-  "你是资深产品经理/运营分析师。你会收到从 Excel 提取的一批“用户反馈”（每批最多 5 行）。",
+  "你是\"像素蛋糕（PixCake）二次元/修图产品\"的资深产品经理。",
+  "你会收到从 Excel 提取的一批用户反馈（每批最多 5 行）。",
   "",
-  "你的任务：将每一行反馈“按需求点拆解”为可入库的独立条目（重点：一行可能拆成多条）。",
+  "## 核心原则",
+  "- 每一行输入都必须产出至少 1 条 item。不允许跳过任何行。",
+  "- 如果输入行本身就是简短的需求标题（如\"打光特效\"、\"去腿毛\"、\"祛鼻贴\"），直接使用原文作为 essence_key 和 feedback_summary，不要过度改写。",
+  "- 只有真正无法理解的乱码/测试文字才标记 is_invalid=true。",
+  "- 如果同一行包含多个独立需求（1. 2. 3. 或分号/换行分隔），才拆成多条。",
   "",
-  "拆解规则：",
-  "- 如果同一行里包含多个独立需求点/Bug/建议（常见形式：1. 2. 3.；换行；分号；顿号；逗号并列），你必须拆成多条 items。",
-  "- 每条 item 都必须明确聚焦一个需求点，避免多个诉求混在一起。",
-  "- 若该行是乱码/测试文字/无意义文本：输出 1 条 item，并设置 is_invalid=true（前端默认不展示）。",
+  "## 分类判断核心规则（极其重要）",
+  "像素蛋糕是一款二次元/Cosplay 修图软件。用户提交的需求绝大多数都跟修图/特效/美化相关。",
+  "**默认分类思路：只要需求跟【图片处理/特效/美化/素材/修图工具】沾边，就应该归为破次元相关分类，不要归为【用户其他反馈】。**",
+  "\"用户其他反馈\"仅用于：纯粹的咨询问题、活动建议、夸奖、疑问等完全不涉及功能需求的内容。",
   "",
-  "每条 item 需要输出：",
-  "- item_id：唯一ID，建议格式 r{row_index}-{sub_index}。",
-  "- row_index：原 Excel 行号（必须原样返回）。",
-  "- sub_index：同一 row_index 拆分出的子序号，从 1 开始递增。",
-  "- essence_key：2~10 字核心需求（底层归纳，同义归并，例如：cos4同步电脑端/同步手机端 -> 跨端协作同步）。",
-  "- category：严格枚举：功能新增|性能优化|用户活动|其他。",
-  "- keywords：关键词数组（用于排名聚合），例如：['画笔工具','性能优化']。",
-  "- tags：可选标签数组（例如：['bug','崩溃','建议']；没有就 []）。",
-  "- original_text：该细项的核心诉求/痛点（<=80字），不要复读整段原文。",
-  "- feedback_summary：一句话总结（<=40字）。",
-  "- weight：1~10 的整数，综合紧迫性+普遍性+影响范围（严重阻断/崩溃/大量用户受影响给高分）。如果某行给了『历史反馈次数』，请把它视为热度信号：次数越高，weight 越高。",
+  "## 像素蛋糕能力分层（决定分类）",
+  "### 破次元/二次元专属能力（已有或可能新增）：",
+  "发丝发光、衣物反重力、头发反重力、碎石+烟雾、暗调、背景净化、自定义效果、",
+  "粒子特效（羽毛/火焰/雷电/樱花/雪花）、二次元风格转换、二次元发型、二次元美瞳、",
+  "去打底裤/祛底裤、辉光、打光特效、漫画脸、眼睛发光、去腿毛/祛腿毛、裙摆扩大、",
+  "武器素材、cos特效、祛鼻贴、去脸部贴纸、动画头发、头发动态效果、",
+  "文字指令生成式修图/AI生成修图、一句话生成特效、AI布景、AI自定义上传素材、",
+  "增加乳沟、去衣褶、衣物平整（cos服装）、自定义美瞳、美瞳色号扩展、",
+  "背景替换、天空替换、画头发光功能、亮度/对比度加深（特效相关）、",
+  "安卓版手机换天空、安卓版手机修复功能/仿制图章、手机版改头像查看氛围感、",
+  "Raw格式支持、色彩管理/色彩空间、图层功能、批量处理、",
+  "所有跟\"祛/去/消除/修复/增加/添加/生成/动画/特效/素材/美瞳/发型/辉光/粒子/打光\"相关的需求。",
+  "### 通用修图/软件能力（非破次元）：",
+  "美颜/磨皮、液化/瘦脸、调色/滤镜、抠图、快捷键、镜头矫正、导入导出、",
+  "设备兼容、付费/会员、创意板块、跨端同步、性能优化/卡顿/崩溃等。",
   "",
-  "输出格式：你必须只输出一个 JSON 对象（不要 markdown，不要解释），形如：",
-  `{"items":[{"item_id":"r12-1","row_index":12,"sub_index":1,"essence_key":"跨端协作同步","category":"功能新增","keywords":["跨端同步","协作"],"tags":[],"original_text":"希望电脑端与手机端功能/素材/参数同步","feedback_summary":"增加跨端同步能力","weight":8,"is_invalid":false}]}`,
-  "items 可以多于输入行数（因为单行可能拆多条）。但 row_index 必须来自输入，且 sub_index 必须从 1 递增。",
+  "## 分类体系（严格四选一）",
+  "- \"破次元新功能需求\"：用户想要的新功能/新特效/新素材（默认首选此项）",
+  "- \"现有破次元功能优化\"：已有功能但效果不好/需改进/有 Bug",
+  "- \"软件非破次元功能需求\"：通用修图/软件工具/付费/设备/UI/性能问题",
+  "- \"用户其他反馈\"：仅限日常咨询、活动建议、夸奖、疑问等纯非功能内容",
+  "",
+  "## 分类示例（必须学习）",
+  "- \"祛鼻贴\" → 破次元新功能需求（去除面部修饰物=修图特效）",
+  "- \"头发反重力支持动画头发\" → 破次元新功能需求（头发动态效果=二次元特效）",
+  "- \"文字指令生成式修图\" → 破次元新功能需求（AI生成修图=新功能）",
+  "- \"祛底裤\" → 破次元新功能需求（去除打底裤=修图特效）",
+  "- \"打光特效\" → 破次元新功能需求",
+  "- \"去腿毛\" → 破次元新功能需求",
+  "- \"增加乳沟\" → 破次元新功能需求",
+  "- \"美瞳色号\" → 现有破次元功能优化（已有美瞳功能，扩展色号）",
+  "- \"AI布景自定义上传素材\" → 破次元新功能需求",
+  "- \"亮度对比度加深\" → 现有破次元功能优化",
+  "- \"cos4同步电脑端\" → 软件非破次元功能需求",
+  "- \"软件卡顿\" → 软件非破次元功能需求",
+  "",
+  "## 每条 item 输出字段",
+  "- item_id：格式 r{row_index}-{sub_index}",
+  "- row_index：原 Excel 行号（必须原样返回）",
+  "- sub_index：从 1 开始递增",
+  "- essence_key：2~10 字核心需求关键词。如果原文已是简短标题，直接用原文。",
+  "- category：严格四选一（见上）",
+  "- keywords：关键词数组",
+  "- tags：可选标签数组（没有就 []）",
+  "- original_text：核心诉求/痛点（<=80字）。如果原文已是简短标题，直接用原文。",
+  "- feedback_summary：一句话总结（<=40字）。如果原文已是简短标题，直接用原文。",
+  "- is_invalid：仅乱码/无意义文本设为 true，其余为 false",
+  "",
+  "输出格式：只输出纯 JSON 对象（不要 markdown、不要解释），形如：",
+  `{"items":[{"item_id":"r1-1","row_index":1,"sub_index":1,"essence_key":"祛鼻贴","category":"破次元新功能需求","keywords":["祛鼻贴","修图"],"tags":[],"original_text":"祛鼻贴","feedback_summary":"祛鼻贴","is_invalid":false}]}`,
   "",
   "强制要求：",
+  "- 每一行输入都必须产出至少 1 条 item，row_index 必须原样返回。",
   "- 只输出纯 JSON，禁止 markdown、禁止解释。",
-  "- category 必须严格枚举。",
-  "- keywords 必须是 JSON 数组（字符串）。",
-  "- weight 必须是 1~10 的整数。",
-  "- 只输出纯 JSON，禁止 markdown、禁止解释。",
+  "- category 必须严格四选一。",
+  "- keywords 必须是 JSON 数组。",
+  "- 跟修图/特效/美化/素材相关的需求不要归为\"用户其他反馈\"。",
 ].join("\n");
 
 export async function POST(req: Request) {
@@ -731,6 +784,37 @@ export async function POST(req: Request) {
           const batches = chunk(rowsSlice, 5);
           const segmentTotalBatches = batches.length;
 
+          let learningExamplesPrompt = "";
+          try {
+            const { data: examples } = await supabaseAdmin
+              .from("ai_learning_examples")
+              .select("original_text, ai_category, corrected_category, ai_essence_key, corrected_essence_key")
+              .order("created_at", { ascending: false })
+              .limit(30);
+            if (examples && examples.length > 0) {
+              const lines = examples.map((ex: any) => {
+                const parts: string[] = [`输入："${ex.original_text}"`];
+                if (ex.ai_category !== ex.corrected_category) {
+                  parts.push(`AI 错误分类："${ex.ai_category}" → 正确分类："${ex.corrected_category}"`);
+                }
+                if (ex.ai_essence_key !== ex.corrected_essence_key) {
+                  parts.push(`AI 错误标题："${ex.ai_essence_key}" → 正确标题："${ex.corrected_essence_key}"`);
+                }
+                return parts.join("，");
+              });
+              learningExamplesPrompt = [
+                "",
+                "## 历史修正记录（必须学习）",
+                "以下是用户对 AI 过去分类/标题错误的修正。遇到类似内容时，请参照修正后的结果：",
+                ...lines,
+              ].join("\n");
+            }
+          } catch {
+            // 表不存在或查询失败，跳过学习示例
+          }
+
+          const effectivePrompt = SYSTEM_PROMPT + learningExamplesPrompt;
+
           const results: StreamItem[] = [];
           let doneBatches = 0;
           let fallbackBatches = 0;
@@ -823,10 +907,10 @@ export async function POST(req: Request) {
               try {
                 const useJson = attempt === 0;
                 try {
-                  lastText = await callModelLocal(SYSTEM_PROMPT, userText, useJson);
+                  lastText = await callModelLocal(effectivePrompt, userText, useJson);
                 } catch (e1: any) {
                   if (useJson) {
-                    lastText = await callModelLocal(SYSTEM_PROMPT, userText, false);
+                    lastText = await callModelLocal(effectivePrompt, userText, false);
                   } else {
                     throw e1;
                   }
@@ -860,7 +944,6 @@ export async function POST(req: Request) {
                   })
                 )
               );
-              await sleep(200);
               return { items: fb, skipped: false, fallback: true };
             }
 
@@ -884,7 +967,6 @@ export async function POST(req: Request) {
                 const invalid = Boolean(x?.is_invalid ?? x?.invalid);
                 const keywords = normalizeStringArray(x?.keywords);
                 const tags = normalizeStringArray(x?.tags);
-                const weight = Math.max(1, Math.min(10, Math.round(Number(x?.weight ?? 3) || 3)));
                 const itemIdRaw = String(x?.item_id ?? "").trim();
                 const itemId =
                   itemIdRaw ||
@@ -902,7 +984,7 @@ export async function POST(req: Request) {
                   date: "",
                   image_url: null,
                   feedback_count: null,
-                  weight,
+                  weight: 1,
                   is_invalid: invalid,
                 };
               })
@@ -940,30 +1022,18 @@ export async function POST(req: Request) {
                 it.date = src.date;
                 it.image_url = src.image_url;
                 it.feedback_count = src.feedback_count;
+                it.weight = Math.max(1, Math.round(Number(src.feedback_count ?? 1) || 1));
                 if (!it.feedback_summary && src.feedback_summary) it.feedback_summary = src.feedback_summary;
-                const fallbackWeight = Math.max(
-                  1,
-                  Math.min(
-                    10,
-                    Math.round(Number(heuristicWeight(src.feedback_voice || src.feedback_summary, src.feedback_count)) || 3)
-                  )
-                );
-                // 若模型没给 weight 或给了偏低值，结合历史反馈次数兜底抬升
-                if (!Number.isFinite(it.weight) || it.weight < 1 || it.weight > 10) {
-                  it.weight = fallbackWeight;
-                } else {
-                  it.weight = Math.max(it.weight, fallbackWeight);
-                }
               }
             }
 
-            await sleep(180);
             return { items, skipped: false, fallback: false };
           };
 
           let pausedByBudget = false;
+          const CONCURRENCY = 3;
 
-          for (let bi = 0; bi < batches.length; bi++) {
+          for (let waveStart = 0; waveStart < batches.length; waveStart += CONCURRENCY) {
             if (Date.now() - startedAt > segmentBudgetMs) {
               pausedByBudget = true;
               await persistProgress(sessionId, currentCursor, lastExcelRow);
@@ -987,9 +1057,31 @@ export async function POST(req: Request) {
               break;
             }
 
-            const batch = batches[bi];
-            const r = await worker(batch);
-            if (r.skipped) {
+            const wave = batches.slice(waveStart, waveStart + CONCURRENCY);
+            const waveResults = await Promise.all(wave.map((batch) => worker(batch)));
+
+            let waveSkipped = false;
+            for (let wi = 0; wi < waveResults.length; wi++) {
+              const r = waveResults[wi];
+              if (r.skipped) {
+                waveSkipped = true;
+                break;
+              }
+
+              for (const it of r.items) {
+                results.push(it);
+                lastExcelRow = it.row_index;
+                controller.enqueue(encoder.encode(toSse("item", it)));
+              }
+
+              currentCursor += wave[wi].length;
+              persistNextIndex = currentCursor;
+              persistLastExcelRow = lastExcelRow;
+
+              doneBatches += 1;
+            }
+
+            if (waveSkipped) {
               pausedByBudget = true;
               await persistProgress(sessionId, currentCursor, lastExcelRow);
               controller.enqueue(
@@ -1012,18 +1104,7 @@ export async function POST(req: Request) {
               break;
             }
 
-            for (const it of r.items) {
-              results.push(it);
-              lastExcelRow = it.row_index;
-              controller.enqueue(encoder.encode(toSse("item", it)));
-            }
-
-            currentCursor += batch.length;
-            persistNextIndex = currentCursor;
-            persistLastExcelRow = lastExcelRow;
             await persistProgress(sessionId, currentCursor, lastExcelRow);
-
-            doneBatches += 1;
             controller.enqueue(
               encoder.encode(
                 toSse("meta", {

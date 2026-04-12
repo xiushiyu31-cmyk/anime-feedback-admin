@@ -2,7 +2,6 @@
 
 import {
   Funnel,
-  LayoutDashboard,
   ListTodo,
   MessageSquarePlus,
   ImagePlus,
@@ -10,55 +9,18 @@ import {
   Send,
   Sparkles,
   Trash2,
-  Layers,
-  Trophy,
   BarChart3,
-  PlusCircle,
+  Trophy,
   FileUp,
+  ClipboardCheck,
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-
-type FeedbackStatus = "pending" | "processing" | "done";
-type MainView = "submit" | "pool" | "ranking" | "weekly" | "import";
-
-type FeedbackItem = {
-  id: string;
-  createdAt: string;
-  userNickname: string | null;
-  operatorName: string | null;
-  category: string | null;
-  essenceKey: string | null;
-  weight: number | null;
-  title: string;
-  detail: string;
-  status: FeedbackStatus;
-  screenshotPublicUrl: string | null;
-  aiSummary: string | null;
-};
-
-type FormState = {
-  note: string;
-  userNickname: string;
-  operatorName: string;
-};
-
-const emptyForm: FormState = {
-  note: "",
-  userNickname: "",
-  operatorName: "",
-};
-
-const statusLabels: Record<FeedbackStatus, string> = {
-  pending: "待处理",
-  processing: "处理中",
-  done: "已完成",
-};
-
-type UiImage = {
-  id: string;
-  file: File;
-  previewUrl: string;
-};
+import { CATEGORIES, normalizeCategoryToDb, getCategoryColorClass } from "@/lib/constants/categories";
+import { Sidebar } from "@/components/layout/Sidebar";
+import { DetailDrawer } from "@/components/DetailDrawer";
+import { useRealtimeFeedback } from "@/hooks/useRealtimeFeedback";
+import type { FeedbackStatus, MainView, FeedbackItem, FormState, UiImage } from "@/lib/types/feedback";
+import { emptyForm, statusLabels } from "@/lib/types/feedback";
 
 function makeId(file: File) {
   return `${file.name}-${file.size}-${file.lastModified}-${Math.random()
@@ -107,15 +69,7 @@ function clamp01(n: number) {
 }
 
 function normalizeImportCategory(raw: string | null | undefined) {
-  const s = String(raw ?? "").trim();
-  if (s === "功能新增" || s === "性能优化" || s === "用户活动" || s === "其他") return s;
-  if (s === "二次元新需求" || s === "二次元新功能需求") return "功能新增";
-  if (s === "现有功能优化" || s === "现有破次元活动功能优化") return "性能优化";
-  if (!s || s === "非二次元需求") return "其他";
-  if (s.includes("活动") || s.includes("运营")) return "用户活动";
-  if (s.includes("优化") || s.includes("性能") || s.includes("卡") || s.includes("慢")) return "性能优化";
-  if (s.includes("新增") || s.includes("支持") || s.includes("增加")) return "功能新增";
-  return "其他";
+  return normalizeCategoryToDb(raw ?? "");
 }
 
 function normalizeImportEssence(raw: string | null | undefined) {
@@ -126,10 +80,8 @@ function normalizeImportEssence(raw: string | null | undefined) {
     .replace(/(需求|功能|问题|建议|优化|支持|体验|能力|方案|功能点)$/g, "");
 }
 
-function candidateImpactScore(weight?: number, feedbackCount?: number | null) {
-  const w = Math.max(1, Math.min(10, Math.round(Number(weight ?? 1) || 1)));
-  const count = Math.max(1, Math.round(Number(feedbackCount ?? 1) || 1));
-  return w + Math.min(8, count - 1);
+function candidateImpactScore(feedbackCount?: number | null) {
+  return Math.max(1, Math.round(Number(feedbackCount ?? 1) || 1));
 }
 
 function csvEscapeCell(v: unknown): string {
@@ -146,7 +98,7 @@ function exportFeedbackPoolCsv(rows: FeedbackItem[], filenameBase: string) {
     "status",
     "category",
     "essence_key",
-    "weight",
+    "feedback_count",
     "title",
     "detail",
     "user_nickname",
@@ -163,7 +115,7 @@ function exportFeedbackPoolCsv(rows: FeedbackItem[], filenameBase: string) {
         csvEscapeCell(r.status),
         csvEscapeCell(r.category),
         csvEscapeCell(r.essenceKey),
-        csvEscapeCell(r.weight ?? ""),
+        csvEscapeCell(r.weight ?? 1),
         csvEscapeCell(r.title),
         csvEscapeCell(r.detail),
         csvEscapeCell(r.userNickname),
@@ -193,14 +145,14 @@ export function FeedbackDashboard() {
   const [saving, setSaving] = useState(false);
   const [analysisError, setAnalysisError] = useState<string | null>(null);
   const [analysisDone, setAnalysisDone] = useState(false);
-  const [draft, setDraft] = useState({
-    title: "",
-    category: "",
-    details: "",
-    essenceKey: "",
-  });
+  const [needsReview, setNeedsReview] = useState(false);
+  type DraftItem = { title: string; category: string; details: string; essenceKey: string };
+  const [drafts, setDrafts] = useState<DraftItem[]>([]);
   const [statusFilter, setStatusFilter] = useState<FeedbackStatus | "all">("all");
   const [origin, setOrigin] = useState<string>("");
+  const [drawerItem, setDrawerItem] = useState<FeedbackItem | null>(null);
+  const [reviewEditItem, setReviewEditItem] = useState<FeedbackItem | null>(null);
+  const [reviewForm, setReviewForm] = useState({ title: "", category: "", details: "", essenceKey: "" });
   useEffect(() => {
     setOrigin(window.location.origin);
   }, []);
@@ -243,6 +195,7 @@ export function FeedbackDashboard() {
           title: i.title,
           detail: i.detail,
           status: i.status,
+          needsReview: i.needs_review === true,
           screenshotPublicUrl: i.screenshot_public_url,
           aiSummary: i.ai_summary,
         }))
@@ -261,6 +214,12 @@ export function FeedbackDashboard() {
   useEffect(() => {
     fetchItems();
   }, [fetchItems]);
+
+  useRealtimeFeedback({
+    onInsert: fetchItems,
+    onUpdate: fetchItems,
+    onDelete: fetchItems,
+  });
 
   const filtered = useMemo(() => {
     if (statusFilter === "all") return items;
@@ -298,47 +257,98 @@ export function FeedbackDashboard() {
     exportFeedbackPoolCsv(poolItems, `二次元需求池_${statusFilter}_${catSlug}_${stamp}`);
   }, [poolItems, statusFilter, categoryFilter]);
 
+  type RankingSource = {
+    id: string;
+    title: string;
+    detail: string;
+    createdAt: string;
+    userNickname: string | null;
+    screenshotPublicUrl: string | null;
+    weight: number;
+  };
+  type RankingRow = {
+    key: string;
+    essenceKey: string;
+    category: string;
+    count: number;
+    latestAt: string;
+    sampleScreenshotUrl: string | null;
+    sources: RankingSource[];
+  };
+
+  const fuzzyMatchEssence = useCallback((a: string, b: string): boolean => {
+    if (a === b) return true;
+    const na = a.replace(/[\s\-_·,.，。、/\\()（）]/g, "").toLowerCase();
+    const nb = b.replace(/[\s\-_·,.，。、/\\()（）]/g, "").toLowerCase();
+    if (na === nb) return true;
+    if (!na || !nb) return false;
+    if (na.includes(nb) || nb.includes(na)) return true;
+    // Jaccard on bigrams for short CJK strings
+    const bigrams = (s: string) => {
+      const set = new Set<string>();
+      for (let i = 0; i < s.length - 1; i++) set.add(s.slice(i, i + 2));
+      return set;
+    };
+    const sa = bigrams(na);
+    const sb = bigrams(nb);
+    if (sa.size === 0 || sb.size === 0) return false;
+    let inter = 0;
+    for (const g of sa) if (sb.has(g)) inter++;
+    const union = sa.size + sb.size - inter;
+    return union > 0 && inter / union >= 0.6;
+  }, []);
+
   const aggregateByDemand = useCallback(
-    (list: FeedbackItem[]) => {
-      const m = new Map<
-        string,
-        {
-          key: string;
-          essenceKey: string;
-          category: string;
-          count: number; // 热度（sum weight）
-          latestAt: string;
-          sampleScreenshotUrl: string | null;
-        }
-      >();
+    (list: FeedbackItem[]): RankingRow[] => {
+      const groups: RankingRow[] = [];
+
+      const findGroup = (essence: string, category: string): RankingRow | undefined => {
+        return groups.find(
+          (g) => g.category === category && fuzzyMatchEssence(g.essenceKey, essence)
+        );
+      };
+
       for (const i of list) {
         const essence = (i.essenceKey ?? "").trim() || (i.title ?? "").trim() || "（未命名需求）";
-      const category = normalizeCategory(i.category);
-      const key = `${category}::${essence}`;
+        const category = normalizeCategory(i.category);
         const w = Number(i.weight ?? 1) || 1;
-        const prev = m.get(key);
+        const src: RankingSource = {
+          id: i.id,
+          title: i.title,
+          detail: i.detail,
+          createdAt: i.createdAt,
+          userNickname: i.userNickname,
+          screenshotPublicUrl: i.screenshotPublicUrl,
+          weight: w,
+        };
+        const prev = findGroup(essence, category);
         if (!prev) {
-          m.set(key, {
-            key,
+          groups.push({
+            key: `${category}::${essence}`,
             essenceKey: essence,
             category,
             count: w,
             latestAt: i.createdAt,
             sampleScreenshotUrl: i.screenshotPublicUrl ?? null,
+            sources: [src],
           });
         } else {
           prev.count += w;
+          prev.sources.push(src);
+          if (essence.length > prev.essenceKey.length) {
+            prev.essenceKey = essence;
+            prev.key = `${category}::${essence}`;
+          }
           if (new Date(i.createdAt).getTime() > new Date(prev.latestAt).getTime()) {
             prev.latestAt = i.createdAt;
             if (i.screenshotPublicUrl) prev.sampleScreenshotUrl = i.screenshotPublicUrl;
           }
         }
       }
-      const rows = Array.from(m.values());
-      rows.sort((a, b) => b.count - a.count || new Date(b.latestAt).getTime() - new Date(a.latestAt).getTime());
-      return rows;
+      groups.sort((a, b) => b.count - a.count || new Date(b.latestAt).getTime() - new Date(a.latestAt).getTime());
+      return groups;
     },
-    [normalizeCategory]
+    [normalizeCategory, fuzzyMatchEssence]
   );
 
   const counts = useMemo(() => {
@@ -378,6 +388,11 @@ export function FeedbackDashboard() {
     [aggregateByDemand, thisWeekItems]
   );
 
+  const [rankingSourceModal, setRankingSourceModal] = useState<{
+    essenceKey: string;
+    sources: RankingSource[];
+  } | null>(null);
+
   const topCategories = useMemo(() => {
     const allMap = new Map<string, number>();
     const weekMap = new Map<string, number>();
@@ -413,19 +428,20 @@ export function FeedbackDashboard() {
     (e: React.FormEvent) => {
       e.preventDefault();
       (async () => {
-        if (images.length === 0) {
-          alert("请先粘贴/上传至少一张截图");
+        if (images.length === 0 && !form.note.trim()) {
+          alert("请提供截图或填写用户原话");
           return;
         }
 
         setAnalyzing(true);
         setAnalysisError(null);
         setAnalysisDone(false);
+        setNeedsReview(false);
+        setDrafts([]);
         try {
-          // 先压缩/缩放截图，避免 base64 太大导致请求很慢
-          const dataUrls = await Promise.all(
-            images.map((img) => downscaleImageToJpegDataUrl(img.file))
-          );
+          const dataUrls = images.length > 0
+            ? await Promise.all(images.map((img) => downscaleImageToJpegDataUrl(img.file)))
+            : [];
 
           const controller = new AbortController();
           const timeout = window.setTimeout(() => controller.abort(), 45_000);
@@ -446,18 +462,48 @@ export function FeedbackDashboard() {
           }
 
           const json = (await res.json()) as {
+            demands?: { summary: string; category: string; details: string; essenceKey?: string }[];
             summary: string;
             category: string;
             details: string;
             userNickname?: string;
             essenceKey?: string;
+            needsReview?: boolean;
           };
-          setDraft({
-            title: json.summary,
-            category: json.category,
-            details: json.details,
-            essenceKey: json.essenceKey?.trim?.() ? json.essenceKey.trim() : "",
-          });
+          const isReview = json.needsReview === true;
+          setNeedsReview(isReview);
+
+          if (isReview) {
+            const fd = new FormData();
+            fd.append("note", form.note.trim());
+            fd.append("user_nickname", (json.userNickname?.trim() || form.userNickname.trim()) || "待审核用户");
+            fd.append("operator_name", form.operatorName.trim() || "青柠");
+            fd.append("title", json.summary || "待人工审核");
+            fd.append("category", json.category || "用户其他反馈");
+            fd.append("details", json.details || form.note.trim());
+            fd.append("essence_key", json.essenceKey || "待人工审核");
+            fd.append("needs_review", "true");
+            for (const img of images) fd.append("screenshots", img.file);
+            await fetch("/api/feedback", { method: "POST", body: fd });
+            setForm(emptyForm);
+            setImages((prev) => { prev.forEach((p) => URL.revokeObjectURL(p.previewUrl)); return []; });
+            await fetchItems();
+            setAnalysisDone(true);
+            setView("review");
+            return;
+          }
+
+          const rawDemands = Array.isArray(json.demands) && json.demands.length > 0
+            ? json.demands
+            : json.summary ? [{ summary: json.summary, category: json.category, details: json.details, essenceKey: json.essenceKey }] : [];
+          setDrafts(
+            rawDemands.map((d) => ({
+              title: String(d.summary ?? "").trim(),
+              category: String(d.category ?? "").trim(),
+              details: String(d.details ?? "").trim(),
+              essenceKey: String(d.essenceKey ?? "").trim(),
+            }))
+          );
           if (json.userNickname && json.userNickname.trim()) {
             setForm((f) => ({ ...f, userNickname: json.userNickname!.trim() }));
           }
@@ -477,15 +523,31 @@ export function FeedbackDashboard() {
     [form.note, images]
   );
 
-  const onSave = useCallback(async () => {
-    if (images.length === 0) {
-      alert("请先粘贴/上传至少一张截图");
-      return;
+  const saveSingleDraft = useCallback(async (draft: DraftItem) => {
+    const fd = new FormData();
+    fd.append("note", form.note.trim());
+    fd.append("user_nickname", form.userNickname.trim());
+    fd.append("operator_name", form.operatorName.trim());
+    fd.append("title", draft.title.trim());
+    fd.append("category", draft.category.trim());
+    fd.append("details", draft.details.trim());
+    fd.append("essence_key", draft.essenceKey.trim());
+    for (const img of images) fd.append("screenshots", img.file);
+
+    const res = await fetch("/api/feedback", { method: "POST", body: fd });
+    if (!res.ok) {
+      const json = await res.json().catch(() => ({}));
+      throw new Error(json?.error ?? `HTTP ${res.status}`);
     }
+  }, [form.note, form.operatorName, form.userNickname, images]);
+
+  const onSave = useCallback(async (index: number) => {
     if (!form.userNickname.trim() || !form.operatorName.trim()) {
       alert("请填写用户昵称和对应运营官");
       return;
     }
+    const draft = drafts[index];
+    if (!draft) return;
     if (!draft.title.trim() || !draft.category.trim() || !draft.details.trim()) {
       alert("请先完成识别，或手动补全 标题/分类/详细说明");
       return;
@@ -497,35 +559,49 @@ export function FeedbackDashboard() {
 
     setSaving(true);
     try {
-      const fd = new FormData();
-      fd.append("note", form.note.trim());
-      fd.append("user_nickname", form.userNickname.trim());
-      fd.append("operator_name", form.operatorName.trim());
-      fd.append("title", draft.title.trim());
-      fd.append("category", draft.category.trim());
-      fd.append("details", draft.details.trim());
-      fd.append("essence_key", draft.essenceKey.trim());
-      for (const img of images) fd.append("screenshots", img.file);
-
-      const res = await fetch("/api/feedback", { method: "POST", body: fd });
-      if (!res.ok) {
-        const json = await res.json().catch(() => ({}));
-        throw new Error(json?.error ?? `HTTP ${res.status}`);
+      await saveSingleDraft(draft);
+      setDrafts((prev) => prev.filter((_, i) => i !== index));
+      if (drafts.length <= 1) {
+        setForm(emptyForm);
+        setImages((prev) => { prev.forEach((p) => URL.revokeObjectURL(p.previewUrl)); return []; });
+        setAnalysisDone(false);
       }
-
-      setForm(emptyForm);
-      setDraft({ title: "", category: "", details: "", essenceKey: "" });
-      setImages((prev) => {
-        prev.forEach((p) => URL.revokeObjectURL(p.previewUrl));
-        return [];
-      });
       await fetchItems();
     } catch (e: any) {
       alert(e?.message ?? "保存失败");
     } finally {
       setSaving(false);
     }
-  }, [draft, fetchItems, form.note, form.operatorName, form.userNickname, images]);
+  }, [drafts, fetchItems, form.operatorName, form.userNickname, saveSingleDraft]);
+
+  const onSaveAll = useCallback(async () => {
+    if (!form.userNickname.trim() || !form.operatorName.trim()) {
+      alert("请填写用户昵称和对应运营官");
+      return;
+    }
+    const incomplete = drafts.find((d) => !d.title.trim() || !d.category.trim() || !d.details.trim() || !d.essenceKey.trim());
+    if (incomplete) {
+      alert("有需求条目信息不完整，请补全或删除后再保存全部");
+      return;
+    }
+    if (drafts.length === 0) return;
+
+    setSaving(true);
+    try {
+      for (const draft of drafts) {
+        await saveSingleDraft(draft);
+      }
+      setForm(emptyForm);
+      setDrafts([]);
+      setImages((prev) => { prev.forEach((p) => URL.revokeObjectURL(p.previewUrl)); return []; });
+      setAnalysisDone(false);
+      await fetchItems();
+    } catch (e: any) {
+      alert(e?.message ?? "批量保存失败");
+    } finally {
+      setSaving(false);
+    }
+  }, [drafts, fetchItems, form.operatorName, form.userNickname, saveSingleDraft]);
 
   const updateStatus = useCallback(
     async (id: string, status: FeedbackStatus) => {
@@ -568,7 +644,12 @@ export function FeedbackDashboard() {
       next.push({ id, file: f, previewUrl });
     }
     if (next.length === 0) return;
-    setImages((prev) => [...prev, ...next]);
+    setImages((prev) => {
+      const existingKeys = new Set(prev.map((p) => `${p.file.name}-${p.file.size}-${p.file.lastModified}`));
+      const deduped = next.filter((n) => !existingKeys.has(`${n.file.name}-${n.file.size}-${n.file.lastModified}`));
+      if (deduped.length === 0) return prev;
+      return [...prev, ...deduped];
+    });
   }, []);
 
   const extractImageFilesFromPaste = useCallback(
@@ -611,46 +692,6 @@ export function FeedbackDashboard() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const sidebarItems: Array<{
-    key: MainView;
-    label: string;
-    icon: React.ReactNode;
-    subtitle: string;
-  }> = useMemo(
-    () => [
-      {
-        key: "submit",
-        label: "提交新反馈",
-        icon: <PlusCircle className="size-4" aria-hidden />,
-        subtitle: "粘贴截图 / GPT-4o 识别",
-      },
-      {
-        key: "import",
-        label: "智能导入中心",
-        icon: <FileUp className="size-4" aria-hidden />,
-        subtitle: "导入钉钉文档（docx/xlsx）",
-      },
-      {
-        key: "pool",
-        label: "需求池",
-        icon: <Layers className="size-4" aria-hidden />,
-        subtitle: "列表 / 筛选 / 状态流转",
-      },
-      {
-        key: "ranking",
-        label: "总排名",
-        icon: <BarChart3 className="size-4" aria-hidden />,
-        subtitle: "累计热度排行榜",
-      },
-      {
-        key: "weekly",
-        label: "周榜单",
-        icon: <Trophy className="size-4" aria-hidden />,
-        subtitle: "本周新增需求排名",
-      },
-    ],
-    []
-  );
 
   return (
     <div className="min-h-[calc(100vh-0px)] bg-gradient-to-b from-violet-50/60 via-white to-white dark:from-violet-950/20 dark:via-zinc-950 dark:to-zinc-950">
@@ -680,71 +721,7 @@ export function FeedbackDashboard() {
       </header>
 
       <div className="mx-auto flex w-full max-w-7xl gap-6 px-4 py-6 sm:px-6 lg:px-8">
-        <aside className="hidden w-72 shrink-0 lg:block">
-          <div className="sticky top-6">
-            <div className="rounded-2xl border border-zinc-200 bg-white/80 p-4 shadow-sm backdrop-blur dark:border-zinc-800 dark:bg-zinc-950/60">
-              <div className="flex items-start justify-between gap-3">
-                <div className="min-w-0">
-                  <div className="flex items-center gap-2 text-sm font-semibold text-violet-700 dark:text-violet-300">
-                    <Sparkles className="size-4 shrink-0" aria-hidden />
-                    二次元修图 · 需求统计
-                  </div>
-                  <div className="mt-1 truncate text-xs text-zinc-500 dark:text-zinc-400">
-                    管理系统（Supabase + AI）
-                  </div>
-                </div>
-                <div className="inline-flex size-9 shrink-0 items-center justify-center rounded-xl bg-violet-600 text-white shadow-sm">
-                  <LayoutDashboard className="size-5" aria-hidden />
-                </div>
-              </div>
-
-              <nav className="mt-4 flex flex-col gap-1">
-                {sidebarItems.map((it) => {
-                  const active = view === it.key;
-                  return (
-                    <button
-                      key={it.key}
-                      type="button"
-                      onClick={() => setView(it.key)}
-                      className={`group flex w-full items-start gap-3 rounded-xl px-3 py-2 text-left transition ${
-                        active
-                          ? "bg-violet-600 text-white shadow-sm"
-                          : "text-zinc-700 hover:bg-zinc-100 dark:text-zinc-200 dark:hover:bg-zinc-900"
-                      }`}
-                    >
-                      <div
-                        className={`mt-0.5 inline-flex size-8 items-center justify-center rounded-lg transition ${
-                          active
-                            ? "bg-white/15"
-                            : "bg-zinc-100 text-violet-700 group-hover:bg-zinc-200 dark:bg-zinc-900 dark:text-violet-300 dark:group-hover:bg-zinc-800"
-                        }`}
-                      >
-                        {it.icon}
-                      </div>
-                      <div className="min-w-0 flex-1">
-                        <div className="text-sm font-semibold">{it.label}</div>
-                        <div className={`mt-0.5 truncate text-xs ${active ? "text-white/80" : "text-zinc-500 dark:text-zinc-400"}`}>
-                          {it.subtitle}
-                        </div>
-                      </div>
-                    </button>
-                  );
-                })}
-              </nav>
-
-              <div className="mt-4 rounded-xl border border-zinc-200 bg-white/70 px-3 py-2 text-xs text-zinc-600 dark:border-zinc-800 dark:bg-zinc-950/50 dark:text-zinc-300">
-                <div className="flex items-center justify-between">
-                  <span>本周新增</span>
-                  <span className="font-semibold text-zinc-900 dark:text-zinc-50">{thisWeekItems.length}</span>
-                </div>
-                <div className="mt-1 flex items-center justify-between">
-                  <span>总需求</span>
-                  <span className="font-semibold text-zinc-900 dark:text-zinc-50">{counts.all}</span>
-                </div>
-              </div>
-            </div>
-          </div>
-        </aside>
+        <Sidebar view={view} setView={setView} thisWeekCount={thisWeekItems.length} totalCount={counts.all} reviewCount={items.filter((i) => i.needsReview).length} />
 
         <main className="min-w-0 flex-1">
 
@@ -763,7 +740,7 @@ export function FeedbackDashboard() {
                   {/* 复用同一套上传+识别+保存表单 */}
                   <div className="flex flex-col gap-1.5 text-sm">
                     <div className="font-medium text-zinc-700 dark:text-zinc-300">
-                      截图粘贴/上传（必填）
+                      截图粘贴/上传（可选）
                     </div>
                     <div
                       tabIndex={0}
@@ -775,13 +752,6 @@ export function FeedbackDashboard() {
                       }}
                       onFocus={() => setPasteArmed(true)}
                       onBlur={() => setPasteArmed(false)}
-                      onPaste={(e) => {
-                        const files = extractImageFilesFromPaste(e);
-                        if (files.length) {
-                          e.preventDefault();
-                          addFiles(files);
-                        }
-                      }}
                       className="flex flex-col gap-3 rounded-xl border border-zinc-200 bg-zinc-50 p-3 outline-none ring-violet-500/30 focus:ring-2 dark:border-zinc-800 dark:bg-zinc-950/40"
                     >
                       <div className="flex items-center justify-between gap-3 text-sm text-zinc-600 dark:text-zinc-300">
@@ -901,86 +871,127 @@ export function FeedbackDashboard() {
                     disabled={analyzing}
                   >
                     <Send className="size-4" aria-hidden />
-                    {analyzing ? "AI 识别中…" : "识别（GPT-4o Vision）"}
+                    {analyzing ? "AI 识别中…" : "识别（AI Vision）"}
                   </button>
 
                   {analysisError ? (
                     <div className="rounded-xl border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700 dark:border-red-900/40 dark:bg-red-950/30 dark:text-red-200">
                       {analysisError}
                     </div>
+                  ) : analysisDone && needsReview ? (
+                    <div className="rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-700 dark:border-amber-900/40 dark:bg-amber-950/30 dark:text-amber-200">
+                      AI 无法确定此内容是否为需求（可能是视频/图片无文字描述），建议人工审核后再决定是否登记。
+                    </div>
+                  ) : analysisDone && drafts.length === 0 ? (
+                    <div className="rounded-xl border border-zinc-200 bg-zinc-50 px-3 py-2 text-xs text-zinc-600 dark:border-zinc-800 dark:bg-zinc-900/30 dark:text-zinc-400">
+                      AI 判定此内容为日常咨询/闲聊，无需记录为需求。
+                    </div>
                   ) : analysisDone ? (
                     <div className="rounded-xl border border-emerald-200 bg-emerald-50 px-3 py-2 text-xs text-emerald-700 dark:border-emerald-900/40 dark:bg-emerald-950/30 dark:text-emerald-200">
-                      识别完成，已自动回填到下方表单（可修改后保存）。
+                      识别完成，共识别出 <strong>{drafts.length}</strong> 条需求（可修改后保存）。
                     </div>
                   ) : null}
 
-                  <div className="rounded-2xl border border-zinc-200 bg-white p-4 dark:border-zinc-800 dark:bg-zinc-950">
-                    <div className="mb-3 text-sm font-semibold text-zinc-900 dark:text-zinc-50">
-                      AI 自动回填（可修改）
-                    </div>
-                    <label className="flex flex-col gap-1.5 text-sm">
-                      <span className="font-medium text-zinc-700 dark:text-zinc-300">
-                        需求标题
-                      </span>
-                      <input
-                        className="rounded-lg border border-zinc-200 bg-zinc-50 px-3 py-2 text-zinc-900 outline-none ring-violet-500/30 placeholder:text-zinc-400 focus:ring-2 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100"
-                        placeholder="识别后自动生成"
-                        value={draft.title}
-                        onChange={(e) =>
-                          setDraft((d) => ({ ...d, title: e.target.value }))
-                        }
-                      />
-                    </label>
-                    <label className="mt-3 flex flex-col gap-1.5 text-sm">
-                      <span className="font-medium text-zinc-700 dark:text-zinc-300">
-                        分类
-                      </span>
-                      <input
-                        className="rounded-lg border border-zinc-200 bg-zinc-50 px-3 py-2 text-zinc-900 outline-none ring-violet-500/30 placeholder:text-zinc-400 focus:ring-2 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100"
-                        placeholder="识别后自动生成"
-                        value={draft.category}
-                        onChange={(e) =>
-                          setDraft((d) => ({ ...d, category: e.target.value }))
-                        }
-                      />
-                    </label>
-                    <label className="mt-3 flex flex-col gap-1.5 text-sm">
-                      <span className="font-medium text-zinc-700 dark:text-zinc-300">
-                        详细说明
-                      </span>
-                      <textarea
-                        rows={5}
-                        className="resize-y rounded-lg border border-zinc-200 bg-zinc-50 px-3 py-2 text-zinc-900 outline-none ring-violet-500/30 placeholder:text-zinc-400 focus:ring-2 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100"
-                        placeholder="识别后自动生成"
-                        value={draft.details}
-                        onChange={(e) =>
-                          setDraft((d) => ({ ...d, details: e.target.value }))
-                        }
-                      />
-                    </label>
-                    <label className="mt-3 flex flex-col gap-1.5 text-sm">
-                      <span className="font-medium text-zinc-700 dark:text-zinc-300">
-                        需求本质（essenceKey，用于总排名语义聚合）
-                      </span>
-                      <input
-                        className="rounded-lg border border-zinc-200 bg-zinc-50 px-3 py-2 text-zinc-900 outline-none ring-violet-500/30 placeholder:text-zinc-400 focus:ring-2 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100"
-                        placeholder="识别后自动生成，例如：二次元脸型液化 / 背景处理优化"
-                        value={draft.essenceKey}
-                        onChange={(e) =>
-                          setDraft((d) => ({ ...d, essenceKey: e.target.value }))
-                        }
-                      />
-                    </label>
+                  {drafts.length > 0 && (
+                    <div className="flex flex-col gap-4">
+                      {drafts.map((draft, idx) => (
+                        <div key={idx} className="relative rounded-2xl border border-zinc-200 bg-white p-4 dark:border-zinc-800 dark:bg-zinc-950">
+                          <div className="mb-3 flex items-center justify-between">
+                            <div className="text-sm font-semibold text-zinc-900 dark:text-zinc-50">
+                              需求 {idx + 1} / {drafts.length}
+                              {draft.category && (
+                                <span className={`ml-2 inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium ${getCategoryColorClass(draft.category)}`}>
+                                  {draft.category}
+                                </span>
+                              )}
+                            </div>
+                            <button
+                              type="button"
+                              onClick={() => setDrafts((prev) => prev.filter((_, i) => i !== idx))}
+                              className="rounded-lg p-1 text-zinc-400 hover:bg-red-50 hover:text-red-500 dark:hover:bg-red-950/30"
+                              title="删除此条"
+                            >
+                              <Trash2 className="size-4" />
+                            </button>
+                          </div>
+                          <label className="flex flex-col gap-1.5 text-sm">
+                            <span className="font-medium text-zinc-700 dark:text-zinc-300">需求标题</span>
+                            <input
+                              className="rounded-lg border border-zinc-200 bg-zinc-50 px-3 py-2 text-zinc-900 outline-none ring-violet-500/30 placeholder:text-zinc-400 focus:ring-2 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100"
+                              placeholder="识别后自动生成"
+                              value={draft.title}
+                              onChange={(e) => setDrafts((prev) => prev.map((d, i) => i === idx ? { ...d, title: e.target.value } : d))}
+                            />
+                          </label>
+                          <label className="mt-3 flex flex-col gap-1.5 text-sm">
+                            <span className="font-medium text-zinc-700 dark:text-zinc-300">分类</span>
+                            <select
+                              className="rounded-lg border border-zinc-200 bg-zinc-50 px-3 py-2 text-zinc-900 outline-none ring-violet-500/30 focus:ring-2 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100"
+                              value={draft.category}
+                              onChange={(e) => setDrafts((prev) => prev.map((d, i) => i === idx ? { ...d, category: e.target.value } : d))}
+                            >
+                              <option value="">请选择分类</option>
+                              {CATEGORIES.map((c) => <option key={c} value={c}>{c}</option>)}
+                            </select>
+                          </label>
+                          <label className="mt-3 flex flex-col gap-1.5 text-sm">
+                            <span className="font-medium text-zinc-700 dark:text-zinc-300">详细说明</span>
+                            <textarea
+                              rows={3}
+                              className="resize-y rounded-lg border border-zinc-200 bg-zinc-50 px-3 py-2 text-zinc-900 outline-none ring-violet-500/30 placeholder:text-zinc-400 focus:ring-2 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100"
+                              placeholder="识别后自动生成"
+                              value={draft.details}
+                              onChange={(e) => setDrafts((prev) => prev.map((d, i) => i === idx ? { ...d, details: e.target.value } : d))}
+                            />
+                          </label>
+                          <label className="mt-3 flex flex-col gap-1.5 text-sm">
+                            <span className="font-medium text-zinc-700 dark:text-zinc-300">需求本质</span>
+                            <input
+                              className="rounded-lg border border-zinc-200 bg-zinc-50 px-3 py-2 text-zinc-900 outline-none ring-violet-500/30 placeholder:text-zinc-400 focus:ring-2 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100"
+                              placeholder="例如：二次元脸型液化 / 背景处理优化"
+                              value={draft.essenceKey}
+                              onChange={(e) => setDrafts((prev) => prev.map((d, i) => i === idx ? { ...d, essenceKey: e.target.value } : d))}
+                            />
+                          </label>
+                          <button
+                            type="button"
+                            onClick={() => onSave(idx)}
+                            disabled={saving}
+                            className="mt-3 inline-flex w-full items-center justify-center gap-2 rounded-xl border border-zinc-200 bg-zinc-50 px-4 py-2 text-sm font-medium text-zinc-700 shadow-sm transition hover:bg-zinc-100 disabled:opacity-60 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-200 dark:hover:bg-zinc-800"
+                          >
+                            {saving ? "保存中…" : "单独保存此条"}
+                          </button>
+                        </div>
+                      ))}
 
-                    <button
-                      type="button"
-                      onClick={onSave}
-                      disabled={saving}
-                      className="mt-4 inline-flex w-full items-center justify-center gap-2 rounded-xl bg-zinc-900 px-4 py-2.5 text-sm font-semibold text-white shadow-sm transition hover:bg-zinc-800 disabled:opacity-60 dark:bg-zinc-100 dark:text-zinc-950 dark:hover:bg-white"
-                    >
-                      {saving ? "保存中…" : "保存到 Supabase"}
-                    </button>
-                  </div>
+                      {drafts.length > 1 && (
+                        <button
+                          type="button"
+                          onClick={onSaveAll}
+                          disabled={saving}
+                          className="inline-flex w-full items-center justify-center gap-2 rounded-xl bg-zinc-900 px-4 py-2.5 text-sm font-semibold text-white shadow-sm transition hover:bg-zinc-800 disabled:opacity-60 dark:bg-zinc-100 dark:text-zinc-950 dark:hover:bg-white"
+                        >
+                          {saving ? "批量保存中…" : `全部保存（${drafts.length} 条）`}
+                        </button>
+                      )}
+                      {drafts.length === 1 && (
+                        <button
+                          type="button"
+                          onClick={() => onSave(0)}
+                          disabled={saving}
+                          className="inline-flex w-full items-center justify-center gap-2 rounded-xl bg-zinc-900 px-4 py-2.5 text-sm font-semibold text-white shadow-sm transition hover:bg-zinc-800 disabled:opacity-60 dark:bg-zinc-100 dark:text-zinc-950 dark:hover:bg-white"
+                        >
+                          {saving ? "保存中…" : "保存到 Supabase"}
+                        </button>
+                      )}
+                    </div>
+                  )}
+
+                  {drafts.length === 0 && !analysisDone && !analysisError && (
+                    <div className="rounded-2xl border border-dashed border-zinc-200 bg-zinc-50/50 p-4 text-center text-sm text-zinc-400 dark:border-zinc-800 dark:bg-zinc-900/30 dark:text-zinc-500">
+                      点击「识别」后，AI 将自动拆分并回填所有需求条目
+                    </div>
+                  )}
                 </form>
               </section>
             ) : view === "import" ? (
@@ -999,6 +1010,86 @@ export function FeedbackDashboard() {
                 </div>
 
                 <ImportCenter />
+              </section>
+            ) : view === "review" ? (
+              <section className="flex flex-col gap-4">
+                <div className="rounded-2xl border border-zinc-200 bg-white p-6 shadow-sm dark:border-zinc-800 dark:bg-zinc-950">
+                  <h2 className="flex items-center gap-2 text-lg font-semibold text-zinc-900 dark:text-zinc-50">
+                    <ClipboardCheck className="size-5 text-amber-500" aria-hidden />
+                    人工审核
+                  </h2>
+                  <p className="mt-1 text-sm text-zinc-600 dark:text-zinc-400">
+                    以下内容 AI 无法判断是否为需求（如用户只发了视频/图片无文字），需要你人工确认。
+                  </p>
+                </div>
+
+                {(() => {
+                  const reviewItems = items.filter((i) => i.needsReview);
+                  if (reviewItems.length === 0) {
+                    return (
+                      <div className="rounded-2xl border border-dashed border-zinc-200 bg-zinc-50/50 p-8 text-center text-sm text-zinc-400 dark:border-zinc-800 dark:bg-zinc-900/30 dark:text-zinc-500">
+                        暂无待审核内容
+                      </div>
+                    );
+                  }
+                  return reviewItems.map((item) => (
+                    <div key={item.id} className="rounded-2xl border border-amber-200 bg-amber-50/30 p-4 shadow-sm dark:border-amber-900/40 dark:bg-amber-950/10">
+                      <div className="flex items-start justify-between gap-3">
+                        <div className="min-w-0 flex-1">
+                          <div className="text-sm font-semibold text-zinc-900 dark:text-zinc-50">
+                            {item.title}
+                          </div>
+                          <div className="mt-1 text-xs text-zinc-500 dark:text-zinc-400">
+                            {item.userNickname && <span>用户：{item.userNickname}</span>}
+                            {item.operatorName && <span className="ml-3">运营官：{item.operatorName}</span>}
+                            <span className="ml-3">{new Date(item.createdAt).toLocaleString("zh-CN")}</span>
+                          </div>
+                          {item.category && (
+                            <span className={`mt-2 inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium ${getCategoryColorClass(item.category)}`}>
+                              {item.category}
+                            </span>
+                          )}
+                          <div className="mt-2 whitespace-pre-wrap rounded-xl border border-zinc-200 bg-white p-3 text-sm text-zinc-700 dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-300">
+                            {item.detail || "（无详细内容）"}
+                          </div>
+                          {item.screenshotPublicUrl && (
+                            <a href={item.screenshotPublicUrl} target="_blank" rel="noopener noreferrer">
+                              <img src={item.screenshotPublicUrl} alt="截图" className="mt-2 max-h-48 rounded-xl border border-zinc-200 object-contain dark:border-zinc-800" />
+                            </a>
+                          )}
+                        </div>
+                      </div>
+                      <div className="mt-3 flex gap-2">
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setReviewEditItem(item);
+                            setReviewForm({
+                              title: item.title === "待人工审核" ? "" : item.title,
+                              category: item.category || "",
+                              details: "",
+                              essenceKey: "",
+                            });
+                          }}
+                          className="inline-flex items-center gap-1.5 rounded-xl bg-emerald-600 px-4 py-2 text-sm font-semibold text-white shadow-sm transition hover:bg-emerald-500"
+                        >
+                          确认登记
+                        </button>
+                        <button
+                          type="button"
+                          onClick={async () => {
+                            if (!confirm("确定丢弃？将从数据库删除此条记录。")) return;
+                            await fetch(`/api/feedback/${encodeURIComponent(item.id)}`, { method: "DELETE" });
+                            await fetchItems();
+                          }}
+                          className="inline-flex items-center gap-1.5 rounded-xl border border-zinc-200 bg-white px-4 py-2 text-sm font-medium text-zinc-600 shadow-sm transition hover:bg-zinc-50 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-300 dark:hover:bg-zinc-800"
+                        >
+                          丢弃
+                        </button>
+                      </div>
+                    </div>
+                  ));
+                })()}
               </section>
             ) : view === "pool" ? (
               <div className="flex flex-col gap-4">
@@ -1023,7 +1114,7 @@ export function FeedbackDashboard() {
                   </summary>
                   <div className="mt-3 text-xs leading-relaxed text-zinc-600 dark:text-zinc-300">
                     <div>
-                      - 分类来自 GPT-4o 视觉识别并对照像素蛋糕能力对比，强制归类为三类。
+                      - 分类来自 AI 视觉识别并对照像素蛋糕能力对比，强制归类为四类。
                     </div>
                     <div>
                       - 总排名按 <span className="font-mono">essenceKey</span>（中文需求本质）语义聚合。
@@ -1143,7 +1234,8 @@ export function FeedbackDashboard() {
               {poolItems.map((item) => (
                 <li
                   key={item.id}
-                  className="rounded-2xl border border-zinc-200 bg-white p-5 shadow-sm dark:border-zinc-800 dark:bg-zinc-950"
+                  className="rounded-2xl border border-zinc-200 bg-white p-5 shadow-sm transition hover:border-violet-300 dark:border-zinc-800 dark:bg-zinc-950 dark:hover:border-violet-800 cursor-pointer"
+                  onClick={() => setDrawerItem(item)}
                 >
                   <div className="flex flex-wrap items-start justify-between gap-3">
                     <div className="min-w-0 flex-1">
@@ -1295,9 +1387,14 @@ export function FeedbackDashboard() {
                               </div>
                               </div>
                             </div>
-                            <span className="rounded-full bg-violet-600 px-2 py-0.5 text-xs font-semibold text-white">
+                            <button
+                              type="button"
+                              title="点击查看来源详情"
+                              onClick={() => setRankingSourceModal({ essenceKey: r.essenceKey, sources: r.sources })}
+                              className="rounded-full bg-violet-600 px-2 py-0.5 text-xs font-semibold text-white transition hover:bg-violet-700 hover:shadow-md cursor-pointer"
+                            >
                               {r.count}
-                            </span>
+                            </button>
                           </li>
                         ))}
                       </ol>
@@ -1384,9 +1481,14 @@ export function FeedbackDashboard() {
                                 <span className="rounded-md bg-violet-100 px-2 py-0.5 text-xs font-medium text-violet-700 dark:bg-violet-950 dark:text-violet-300">
                                   {r.category}
                                 </span>
-                                <span className="rounded-full bg-violet-600 px-2 py-0.5 text-xs font-semibold text-white">
+                                <button
+                                  type="button"
+                                  title="点击查看来源详情"
+                                  onClick={() => setRankingSourceModal({ essenceKey: r.essenceKey, sources: r.sources })}
+                                  className="rounded-full bg-violet-600 px-2 py-0.5 text-xs font-semibold text-white transition hover:bg-violet-700 hover:shadow-md cursor-pointer"
+                                >
                                   {r.count}
-                                </span>
+                                </button>
                               </div>
                             </div>
                           </li>
@@ -1431,6 +1533,161 @@ export function FeedbackDashboard() {
           </div>
         </main>
       </div>
+      <DetailDrawer item={drawerItem} onClose={() => setDrawerItem(null)} />
+
+      {rankingSourceModal && (
+        <>
+          <div className="fixed inset-0 z-40 bg-black/30 backdrop-blur-sm" onClick={() => setRankingSourceModal(null)} />
+          <div className="fixed inset-x-4 top-[10%] z-50 mx-auto max-w-2xl rounded-2xl border border-zinc-200 bg-white p-6 shadow-2xl dark:border-zinc-700 dark:bg-zinc-900 sm:inset-x-auto sm:w-full">
+            <div className="flex items-center justify-between">
+              <h3 className="text-base font-semibold text-zinc-900 dark:text-zinc-50">
+                「{rankingSourceModal.essenceKey}」来源详情（{rankingSourceModal.sources.length} 条）
+              </h3>
+              <button
+                type="button"
+                onClick={() => setRankingSourceModal(null)}
+                className="rounded-lg p-1 text-zinc-400 hover:bg-zinc-100 hover:text-zinc-600 dark:hover:bg-zinc-800 dark:hover:text-zinc-200"
+              >
+                <X className="size-5" />
+              </button>
+            </div>
+            <div className="mt-4 max-h-[60vh] overflow-y-auto">
+              <div className="flex flex-col gap-3">
+                {rankingSourceModal.sources
+                  .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())
+                  .map((src, idx) => (
+                  <div key={src.id} className="rounded-xl border border-zinc-200 bg-zinc-50/60 p-4 dark:border-zinc-800 dark:bg-zinc-900/30">
+                    <div className="flex items-start gap-3">
+                      {src.screenshotPublicUrl && (
+                        <img
+                          src={src.screenshotPublicUrl}
+                          alt="来源截图"
+                          className="h-16 w-24 shrink-0 rounded-lg object-cover ring-1 ring-zinc-200 dark:ring-zinc-700"
+                          loading="lazy"
+                        />
+                      )}
+                      <div className="min-w-0 flex-1">
+                        <div className="flex items-center gap-2 text-xs text-zinc-500 dark:text-zinc-400">
+                          <span className="inline-flex size-5 items-center justify-center rounded bg-zinc-200 text-[10px] font-bold text-zinc-600 dark:bg-zinc-700 dark:text-zinc-300">
+                            {idx + 1}
+                          </span>
+                          <span>{new Date(src.createdAt).toLocaleString("zh-CN")}</span>
+                          {src.userNickname && (
+                            <span className="rounded bg-violet-100 px-1.5 py-0.5 font-medium text-violet-700 dark:bg-violet-950 dark:text-violet-300">
+                              {src.userNickname}
+                            </span>
+                          )}
+                          {src.weight > 1 && (
+                            <span className="ml-auto rounded bg-violet-50 px-1.5 py-0.5 font-medium text-violet-600 dark:bg-violet-950 dark:text-violet-300">
+                              {src.weight} 条反馈
+                            </span>
+                          )}
+                        </div>
+                        <div className="mt-1.5 text-sm font-medium text-zinc-900 dark:text-zinc-100">
+                          {src.title}
+                        </div>
+                        {src.detail && src.detail !== src.title && (
+                          <div className="mt-1 text-sm text-zinc-600 dark:text-zinc-400 whitespace-pre-wrap line-clamp-4">
+                            {src.detail}
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+        </>
+      )}
+
+      {reviewEditItem && (
+        <>
+          <div className="fixed inset-0 z-40 bg-black/30 backdrop-blur-sm" onClick={() => setReviewEditItem(null)} />
+          <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
+            <div className="w-full max-w-lg rounded-2xl border border-zinc-200 bg-white p-6 shadow-2xl dark:border-zinc-800 dark:bg-zinc-950" onClick={(e) => e.stopPropagation()}>
+              <h3 className="text-lg font-semibold text-zinc-900 dark:text-zinc-50">人工登记需求</h3>
+              <p className="mt-1 text-xs text-zinc-500 dark:text-zinc-400">请根据截图/内容填写用户的实际需求</p>
+
+              {reviewEditItem.screenshotPublicUrl && (
+                <a href={reviewEditItem.screenshotPublicUrl} target="_blank" rel="noopener noreferrer">
+                  <img src={reviewEditItem.screenshotPublicUrl} alt="截图" className="mt-3 max-h-32 rounded-xl border border-zinc-200 object-contain dark:border-zinc-800" />
+                </a>
+              )}
+              {reviewEditItem.detail && reviewEditItem.detail !== "（无详细内容）" && (
+                <div className="mt-3 max-h-24 overflow-y-auto rounded-lg border border-zinc-200 bg-zinc-50 p-2 text-xs text-zinc-600 dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-400">
+                  {reviewEditItem.detail}
+                </div>
+              )}
+
+              <label className="mt-4 flex flex-col gap-1.5 text-sm">
+                <span className="font-medium text-zinc-700 dark:text-zinc-300">需求标题</span>
+                <input
+                  className="rounded-lg border border-zinc-200 bg-zinc-50 px-3 py-2 text-zinc-900 outline-none ring-violet-500/30 placeholder:text-zinc-400 focus:ring-2 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100"
+                  placeholder="用户想要什么"
+                  value={reviewForm.title}
+                  onChange={(e) => setReviewForm((f) => ({ ...f, title: e.target.value }))}
+                />
+              </label>
+              <label className="mt-3 flex flex-col gap-1.5 text-sm">
+                <span className="font-medium text-zinc-700 dark:text-zinc-300">分类</span>
+                <select
+                  className="rounded-lg border border-zinc-200 bg-zinc-50 px-3 py-2 text-zinc-900 outline-none ring-violet-500/30 focus:ring-2 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100"
+                  value={reviewForm.category}
+                  onChange={(e) => setReviewForm((f) => ({ ...f, category: e.target.value }))}
+                >
+                  <option value="">请选择分类</option>
+                  {CATEGORIES.map((c) => <option key={c} value={c}>{c}</option>)}
+                </select>
+              </label>
+              <label className="mt-3 flex flex-col gap-1.5 text-sm">
+                <span className="font-medium text-zinc-700 dark:text-zinc-300">详细说明</span>
+                <textarea
+                  rows={3}
+                  className="resize-y rounded-lg border border-zinc-200 bg-zinc-50 px-3 py-2 text-zinc-900 outline-none ring-violet-500/30 placeholder:text-zinc-400 focus:ring-2 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100"
+                  placeholder="用户遇到了什么问题 / 希望怎么改进"
+                  value={reviewForm.details}
+                  onChange={(e) => setReviewForm((f) => ({ ...f, details: e.target.value }))}
+                />
+              </label>
+              <div className="mt-5 flex gap-2">
+                <button
+                  type="button"
+                  onClick={async () => {
+                    if (!reviewForm.title.trim() || !reviewForm.category) {
+                      alert("请至少填写需求标题和分类");
+                      return;
+                    }
+                    await fetch(`/api/feedback/${encodeURIComponent(reviewEditItem.id)}`, {
+                      method: "PATCH",
+                      headers: { "Content-Type": "application/json" },
+                      body: JSON.stringify({
+                        needs_review: false,
+                        title: reviewForm.title.trim(),
+                        category: reviewForm.category,
+                        detail: reviewForm.details.trim() || reviewEditItem.detail,
+                        essence_key: reviewForm.title.trim(),
+                      }),
+                    });
+                    setReviewEditItem(null);
+                    await fetchItems();
+                  }}
+                  className="flex-1 rounded-xl bg-emerald-600 px-4 py-2.5 text-sm font-semibold text-white shadow-sm transition hover:bg-emerald-500"
+                >
+                  确认登记
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setReviewEditItem(null)}
+                  className="rounded-xl border border-zinc-200 bg-white px-4 py-2.5 text-sm font-medium text-zinc-600 shadow-sm transition hover:bg-zinc-50 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-300"
+                >
+                  取消
+                </button>
+              </div>
+            </div>
+          </div>
+        </>
+      )}
     </div>
   );
 }
@@ -1503,6 +1760,8 @@ function ImportCenter() {
     is_invalid?: boolean;
     image_index: number | null;
     selected: boolean;
+    ai_essence_key?: string;
+    ai_category?: string;
   };
   const importCandPendingRef = useRef<ImportCandRow[]>([]);
   const importCandRafRef = useRef<number | null>(null);
@@ -1626,8 +1885,8 @@ function ImportCenter() {
   const displayCandidates = useMemo(() => {
     return [...candidates].sort((a, b) => {
       const impactDiff =
-        candidateImpactScore(b.weight, b.feedback_count) -
-        candidateImpactScore(a.weight, a.feedback_count);
+        candidateImpactScore(b.feedback_count) -
+        candidateImpactScore(a.feedback_count);
       if (impactDiff !== 0) return impactDiff;
       const mentionDiff =
         Math.max(1, Math.round(Number(b.feedback_count ?? 1) || 1)) -
@@ -1661,12 +1920,12 @@ function ImportCenter() {
       const category = normalizeImportCategory(c.category);
       const normalizedEssence = normalizeImportEssence(c.essence_key);
       const mentionCount = Math.max(1, Math.round(Number(c.feedback_count ?? 1) || 1));
-      const impact = candidateImpactScore(c.weight, c.feedback_count);
+      const impact = candidateImpactScore(c.feedback_count);
       const key = `${category}::${normalizedEssence || c.essence_key.trim() || c.id}`;
 
       totalMentions += mentionCount;
       if (c.selected) selectedCount += 1;
-      if ((c.weight ?? 0) >= 8 || mentionCount >= 5 || impact >= 10) highPriorityCount += 1;
+      if (mentionCount >= 5) highPriorityCount += 1;
 
       const prev = groups.get(key);
       if (!prev) {
@@ -1910,6 +2169,8 @@ function ImportCenter() {
               is_invalid: invalid,
               image_index: null,
               selected: true,
+              ai_essence_key: essence,
+              ai_category: cat,
             });
             scheduleImportCandidateFlush();
           };
@@ -1997,7 +2258,7 @@ function ImportCenter() {
                     const lr = excelRow != null && Number.isFinite(excelRow) ? excelRow : null;
                     setImportLineProgress({ done: procR, total: totalR, lastRow: lr });
                     setProgressText(
-                      `正在使用 GPT-4o 解析中（第 ${round} 轮）：已完成 ${procR}/${totalR} 行（本段批次 ${payload.done_batches}/${payload.total_batches}，累计条目 ${payload.done_items ?? 0}）${lr != null ? ` · Excel 约至第 ${lr} 行` : ""}${fb > 0 ? ` · 规则兜底 ${fb}` : ""}`
+                      `正在使用 AI 解析中（第 ${round} 轮）：已完成 ${procR}/${totalR} 行（本段批次 ${payload.done_batches}/${payload.total_batches}，累计条目 ${payload.done_items ?? 0}）${lr != null ? ` · Excel 约至第 ${lr} 行` : ""}${fb > 0 ? ` · 规则兜底 ${fb}` : ""}`
                     );
                     setProgress(totalR > 0 ? clamp01(procR / totalR) : 0);
                     if (payload.session_id != null && totalR > 0) {
@@ -2010,7 +2271,7 @@ function ImportCenter() {
                     setImportLineProgress({ done: procR, total: totalR, lastRow: lr });
                     outcome.lastRow = lr ?? outcome.lastRow;
                     setProgressText(
-                      `正在使用 GPT-4o 解析中（第 ${round} 轮）：本段已达单次上限，已处理 ${procR}/${totalR} 行${lr != null ? `（Excel 约 ${lr} 行）` : ""}，将自动开始下一轮…${fb > 0 ? ` 规则兜底 ${fb}` : ""}`
+                      `正在使用 AI 解析中（第 ${round} 轮）：本段已达单次上限，已处理 ${procR}/${totalR} 行${lr != null ? `（Excel 约 ${lr} 行）` : ""}，将自动开始下一轮…${fb > 0 ? ` 规则兜底 ${fb}` : ""}`
                     );
                     setProgress(totalR > 0 ? clamp01(procR / totalR) : 0);
                     if (payload.session_id != null && totalR > 0) {
@@ -2044,7 +2305,7 @@ function ImportCenter() {
                       setParseCanResume(false);
                       setProgress(totalR > 0 ? clamp01(procR / totalR) : 0);
                       setProgressText(
-                      `GPT-4o 解析中：第 ${round} 轮结束，已处理 ${procR}/${totalR} 行，条目 ${payload.done_items ?? 0} 条${lr != null ? ` · Excel 约 ${lr} 行` : ""}，即将自动续传…${fb > 0 ? ` · 规则兜底 ${fb}` : ""}`
+                      `AI 解析中：第 ${round} 轮结束，已处理 ${procR}/${totalR} 行，条目 ${payload.done_items ?? 0} 条${lr != null ? ` · Excel 约 ${lr} 行` : ""}，即将自动续传…${fb > 0 ? ` · 规则兜底 ${fb}` : ""}`
                       );
                       if (payload.session_id != null && totalR > 0) {
                         persistImportLs(String(payload.session_id), totalR, procR);
@@ -2165,18 +2426,24 @@ function ImportCenter() {
           const items = Array.isArray(json?.items) ? json.items : [];
           setParsedImages(imgs);
           setCandidates(
-            items.map((it: any, idx: number) => ({
-              id: `cand-${idx}-${String(it?.essence_key ?? "").slice(0, 12)}-${String(it?.image_index ?? "n")}`,
-              essence_key: String(it?.essence_key ?? "").trim(),
-              original_text: String(it?.original_text ?? "").trim(),
-              category: String(it?.category ?? "").trim(),
-              feedback_count: null,
-              image_index:
-                it?.image_index === null || it?.image_index === undefined || it?.image_index === ""
-                  ? null
-                  : Number(it.image_index),
-              selected: true,
-            }))
+            items.map((it: any, idx: number) => {
+              const ek = String(it?.essence_key ?? "").trim();
+              const cat = String(it?.category ?? "").trim();
+              return {
+                id: `cand-${idx}-${ek.slice(0, 12)}-${String(it?.image_index ?? "n")}`,
+                essence_key: ek,
+                original_text: String(it?.original_text ?? "").trim(),
+                category: cat,
+                feedback_count: null,
+                image_index:
+                  it?.image_index === null || it?.image_index === undefined || it?.image_index === ""
+                    ? null
+                    : Number(it.image_index),
+                selected: true,
+                ai_essence_key: ek,
+                ai_category: cat,
+              };
+            })
           );
         } catch (docxErr: unknown) {
           if (isDomAbortError(docxErr) && parseCancelRequestedRef.current) {
@@ -2230,13 +2497,33 @@ function ImportCenter() {
     setCommitting(true);
     setCommitResult(null);
     try {
+      const corrections = picked.filter((c) => {
+        const catChanged = c.ai_category && c.category !== c.ai_category;
+        const ekChanged = c.ai_essence_key && c.essence_key !== c.ai_essence_key;
+        return catChanged || ekChanged;
+      });
+      if (corrections.length > 0) {
+        fetch("/api/import/learn", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            corrections: corrections.map((c) => ({
+              original_text: c.original_text,
+              ai_essence_key: c.ai_essence_key ?? c.essence_key,
+              ai_category: c.ai_category ?? c.category,
+              corrected_essence_key: c.essence_key,
+              corrected_category: c.category,
+            })),
+          }),
+        }).catch(() => {});
+      }
       const body = {
         operatorName: operatorName || undefined,
         items: picked.map((c) => ({
           essence_key: c.essence_key,
           original_text: c.original_text,
           category: c.category,
-          weight: Number(c.weight ?? 1) === 5 ? 5 : 1,
+          weight: Math.max(1, Math.round(Number(c.feedback_count ?? 1) || 1)),
           image_data_url:
             c.image_index !== null && parsedImages[c.image_index]
               ? parsedImages[c.image_index]
@@ -2254,7 +2541,8 @@ function ImportCenter() {
         const sql = json?.sql ? `\n需要你在 Supabase 执行：\n${json.sql}` : "";
         throw new Error((json?.error ?? `HTTP ${res.status}`) + sql);
       }
-      setCommitResult(`导入成功：新增 ${json?.created ?? 0} 条`);
+      const learnMsg = corrections.length > 0 ? `，已学习 ${corrections.length} 条修正` : "";
+      setCommitResult(`导入成功：新增 ${json?.created ?? 0} 条${learnMsg}`);
     } catch (e: any) {
       setCommitResult(e?.message ?? "导入失败");
     } finally {
@@ -2430,12 +2718,12 @@ function ImportCenter() {
             {importAutoRound > 0 ? (
               <div className="mb-1.5 font-semibold text-zinc-800 dark:text-zinc-100">
                 {importLineProgress.total > 0
-                  ? `正在使用 GPT-4o 解析中…（第 ${importAutoRound} 轮）已完成 ${importLineProgress.done}/${importLineProgress.total} 行${
+                  ? `正在使用 AI 解析中…（第 ${importAutoRound} 轮）已完成 ${importLineProgress.done}/${importLineProgress.total} 行${
                       importLineProgress.lastRow != null
                         ? `（Excel 约 ${importLineProgress.lastRow} 行）`
                         : ""
                     }`
-                  : `正在使用 GPT-4o 解析中…（第 ${importAutoRound} 轮）`}
+                  : `正在使用 AI 解析中…（第 ${importAutoRound} 轮）`}
               </div>
             ) : null}
             <div className="flex items-center justify-between gap-3">
@@ -2655,26 +2943,9 @@ function ImportCenter() {
                         ) : null}
                         {c.category ? (
                           <span
-                            className={`inline-flex items-center rounded-full px-2 py-0.5 text-[11px] font-semibold ${
-                              normalizeImportCategory(c.category) === "功能新增"
-                                ? "bg-violet-100 text-violet-700 dark:bg-violet-950/40 dark:text-violet-200"
-                                : normalizeImportCategory(c.category) === "性能优化"
-                                  ? "bg-amber-100 text-amber-700 dark:bg-amber-950/30 dark:text-amber-200"
-                                  : "bg-zinc-100 text-zinc-700 dark:bg-zinc-900 dark:text-zinc-200"
-                            }`}
+                            className={`inline-flex items-center rounded-full px-2 py-0.5 text-[11px] font-semibold ${getCategoryColorClass(c.category)}`}
                           >
                             {normalizeImportCategory(c.category)}
-                          </span>
-                        ) : null}
-                        {typeof c.weight === "number" ? (
-                          <span
-                            className={`inline-flex items-center rounded-full px-2 py-0.5 text-[11px] font-semibold ${
-                              c.weight >= 5
-                                ? "bg-red-100 text-red-700 dark:bg-red-950/30 dark:text-red-200"
-                                : "bg-emerald-100 text-emerald-700 dark:bg-emerald-950/30 dark:text-emerald-200"
-                            }`}
-                          >
-                            权重 {c.weight}
                           </span>
                         ) : null}
                         {typeof c.feedback_count === "number" ? (
@@ -2719,15 +2990,9 @@ function ImportCenter() {
                             )
                           }
                         >
-                          <option value="功能新增">功能新增</option>
-                          <option value="性能优化">性能优化</option>
-                          <option value="用户活动">用户活动</option>
-                          <option value="其他">其他</option>
-                          <option value="二次元新需求">二次元新需求</option>
-                          <option value="现有功能优化">现有功能优化</option>
-                          <option value="二次元新功能需求">二次元新功能需求</option>
-                          <option value="现有破次元活动功能优化">现有破次元活动功能优化</option>
-                          <option value="非二次元需求">非二次元需求</option>
+                          {CATEGORIES.map((cat) => (
+                            <option key={cat} value={cat}>{cat}</option>
+                          ))}
                         </select>
                       </div>
                       <textarea
