@@ -1,5 +1,6 @@
 import OpenAI from "openai";
 import { getSupabaseAdminOrError } from "@/lib/supabase/server";
+import { forceCorrectCategory } from "./category-rules";
 
 export type AnalyzeFeedbackImageInput =
   | { type: "data_url"; data_url: string }
@@ -408,12 +409,18 @@ export async function analyzeFeedbackWithAi(input: AnalyzeFeedbackInput): Promis
     : [];
 
   const demands: AnalyzeFeedbackDemand[] = rawDemands
-    .map((d: any) => ({
-      summary: String(d?.summary ?? "").trim(),
-      category: String(d?.category ?? "").trim(),
-      details: String(d?.details ?? "").trim(),
-      essenceKey: String(d?.essenceKey ?? "").trim(),
-    }))
+    .map((d: any) => {
+      const summary = String(d?.summary ?? "").trim();
+      const rawCategory = String(d?.category ?? "").trim();
+      const details = String(d?.details ?? "").trim();
+      const essenceKey = String(d?.essenceKey ?? "").trim();
+      const correctedCategory = forceCorrectCategory(
+        essenceKey || summary,
+        details || summary,
+        rawCategory,
+      );
+      return { summary, category: correctedCategory, details, essenceKey };
+    })
     .filter((d) => d.summary && d.category);
 
   // 兼容旧格式：如果 AI 没返回 demands 数组但返回了旧的顶层字段

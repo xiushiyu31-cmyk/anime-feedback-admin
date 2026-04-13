@@ -1,6 +1,7 @@
 import OpenAI from "openai";
 import * as XLSX from "xlsx";
 import { getSupabaseAdminOrError } from "@/lib/supabase/server";
+import { forceCorrectCategory } from "@/lib/ai/category-rules";
 
 const IMPORT_TEMP_BUCKET = "import-temp";
 
@@ -240,6 +241,7 @@ function normalizeCategory(raw: string): OutCategory {
   if (s === "用户活动" || s === "其他") return "用户其他反馈";
   return "用户其他反馈";
 }
+
 
 function heuristicWeight(text: string, feedbackCount?: number | null) {
   const s = String(text ?? "");
@@ -971,15 +973,18 @@ export async function POST(req: Request) {
                 const itemId =
                   itemIdRaw ||
                   (Number.isFinite(rowIndex) && subIndex > 0 ? `r${rowIndex}-${subIndex}` : "");
+                const normalizedCat = normalizeCategory(String(x?.category ?? ""));
+                const origText = String(x?.original_text ?? "").trim().slice(0, 200);
+                const correctedCat = forceCorrectCategory(essence, origText, normalizedCat) as OutCategory;
                 return {
                   row_index: rowIndex,
                   sub_index: subIndex,
                   item_id: itemId,
                   essence_key: essence,
-                  category: normalizeCategory(String(x?.category ?? "")),
+                  category: correctedCat,
                   keywords,
                   tags,
-                  original_text: String(x?.original_text ?? "").trim().slice(0, 200),
+                  original_text: origText,
                   feedback_summary: String(x?.feedback_summary ?? "").trim().slice(0, 120),
                   date: "",
                   image_url: null,
